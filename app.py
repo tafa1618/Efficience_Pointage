@@ -1,139 +1,181 @@
 import streamlit as st
 import pandas as pd
 
+# ======================================================
+# CONFIG PAGE
+# ======================================================
 st.set_page_config(
-    page_title="Efficience Pointage OR",
+    page_title="Efficience des pointages OR",
     layout="wide"
 )
 
-st.title("📊 Analyse d'efficience des pointages OR")
+st.title("📊 Analyse d’efficience des pointages OR")
 
-# =========================
-# Upload fichier
-# =========================
+# ======================================================
+# UPLOAD FICHIER
+# ======================================================
 uploaded_file = st.file_uploader(
-    "📥 Charger le fichier Excel (Pointage + BO)",
+    "📥 Charger le fichier Excel (Pointage + BASE_BO)",
     type=["xlsx"]
 )
 
-if uploaded_file:
+if not uploaded_file:
+    st.info("⬆️ Charge le fichier Excel pour démarrer l’analyse.")
+    st.stop()
 
-    # =========================
-    # Lecture des données
-    # =========================
-    pointage = pd.read_excel(uploaded_file, sheet_name="Pointage")
-    bo = pd.read_excel(uploaded_file, sheet_name="BASE_BO")
+# ======================================================
+# LECTURE DES DONNÉES
+# ======================================================
+pointage = pd.read_excel(uploaded_file, sheet_name="Pointage")
+bo = pd.read_excel(uploaded_file, sheet_name="BASE_BO")
 
-    # Nettoyage OR
-    pointage["OR"] = pointage["OR"].astype(str)
-    bo["N° OR"] = bo["N° OR"].astype(str)
+# ======================================================
+# HARMONISATION DES COLONNES (STRICTEMENT SELON TES NOMS)
+# ======================================================
+# Pointage
+pointage["OR"] = pointage["OR (Numéro)"].astype(str)
+pointage["Technicien"] = pointage["Salarié - Nom"]
+pointage["Equipe"] = pointage["Salarié - Equipe(Nom)"]
+pointage["Heures"] = pointage["Hr_travaillée"]
 
-    # =========================
-    # Agrégation POINTAGE
-    # =========================
-    agg_or = (
-        pointage
-        .groupby("OR")
-        .agg(
-            Heures_totales_OR=("Hr_travaillée", "sum"),
-            Nb_techniciens=("Salarié - Nom", "nunique")
-        )
-        .reset_index()
+# BO
+bo["OR"] = bo["N° OR (Segment)"].astype(str)
+bo["Temps_reference_OR"] = bo["Temps vendu (OR)"].fillna(
+    bo["Temps prévu devis (OR)"]
+)
+
+# ======================================================
+# TABLE 1 — POINTAGE OR AGRÉGÉ (1 OR = 1 LIGNE)
+# ======================================================
+agg_or = (
+    pointage
+    .groupby("OR")
+    .agg(
+        Heures_totales_OR=("Heures", "sum"),
+        Nb_techniciens=("Technicien", "nunique")
     )
+    .reset_index()
+)
 
-    # =========================
-    # Technicien principal
-    # =========================
-    tech_principal = (
-        pointage
-        .sort_values("Hr_travaillée", ascending=False)
-        .drop_duplicates("OR")
-        [["OR", "Salarié - Nom", "Salarié - Equipe"]]
-        .rename(columns={
-            "Salarié - Nom": "Technicien_principal",
-            "Salarié - Equipe": "Equipe_principale"
-        })
+# ======================================================
+# TECHNICIEN PRINCIPAL (celui qui a le + d’heures)
+# ======================================================
+tech_principal = (
+    pointage
+    .sort_values("Heures", ascending=False)
+    .drop_duplicates("OR")
+    [["OR", "Technicien", "Equipe"]]
+    .rename(columns={
+        "Technicien": "Technicien_principal",
+        "Equipe": "Equipe_principale"
+    })
+)
+
+pointage_or = agg_or.merge(
+    tech_principal,
+    on="OR",
+    how="left"
+)
+
+pointage_or["OR_multi_tech"] = pointage_or["Nb_techniciens"].apply(
+    lambda x: "OUI" if x > 1 else "NON"
+)
+
+# ======================================================
+# TABLE 2 — POINTAGE OR x TECH (détail opérationnel)
+# ======================================================
+pointage_or_tech = (
+    pointage
+    .groupby(["OR", "Technicien", "Equipe"])
+    .agg(
+        Heures_technicien=("Heures", "sum")
     )
+    .reset_index()
+)
 
-    pointage_or = agg_or.merge(
-        tech_principal,
-        on="OR",
-        how="left"
-    )
+pointage_or_tech = pointage_or_tech.merge(
+    pointage_or[["OR", "Heures_totales_OR"]],
+    on="OR",
+    how="left"
+)
 
-    pointage_or["OR_multi_tech"] = pointage_or["Nb_techniciens"].apply(
-        lambda x: "OUI" if x > 1 else "NON"
-    )
+pointage_or_tech["Part_OR_%"] = (
+    pointage_or_tech["Heures_technicien"]
+    / pointage_or_tech["Heures_totales_OR"]
+) * 100
 
-    # =========================
-    # Préparation BO
-    # =========================
-    bo["Temps_reference_OR"] = bo["Temps vendu (OR)"].fillna(
-        bo["Temps prévu devis (OR)"]
-    )
+# ======================================================
+# MERGE AVEC BO (APRÈS calculs pointage)
+# ======================================================
+bo_or = bo[[
+    "OR",
+    "Temps_reference_OR",
+    "Durée pointage agents productifs (OR)"
+]]
 
-    bo_or = bo[[
-        "N° OR",
-        "Temps_reference_OR",
-        "Durée pointage agents productifs (OR)"
-    ]].rename(columns={"N° OR": "OR"})
+df_final = pointage_or.merge(
+    bo_or,
+    on="OR",
+    how="left"
+)
 
-    # =========================
-    # Merge final
-    # =========================
-    df_final = pointage_or.merge(
-        bo_or,
-        on="OR",
-        how="left"
-    )
+# ======================================================
+# INDICATEURS
+# ======================================================
+df_final["Taux_couverture_OR"] = (
+    df_final["Heures_totales_OR"] / df_final["Temps_reference_OR"]
+)
 
-    # =========================
-    # Indicateurs
-    # =========================
-    df_final["Taux_couverture_OR"] = (
-        df_final["Heures_totales_OR"] / df_final["Temps_reference_OR"]
-    )
+# ======================================================
+# KPI GLOBAUX
+# ======================================================
+st.subheader("📌 Indicateurs globaux")
 
-    # =========================
-    # KPI globaux
-    # =========================
-    col1, col2, col3, col4 = st.columns(4)
+c1, c2, c3, c4 = st.columns(4)
 
-    col1.metric("OR analysés", df_final.shape[0])
-    col2.metric("OR multi-techniciens", df_final[df_final["OR_multi_tech"] == "OUI"].shape[0])
-    col3.metric("Heures pointées totales", round(df_final["Heures_totales_OR"].sum(), 1))
-    col4.metric(
-        "OR sans temps BO",
-        df_final["Temps_reference_OR"].isna().sum()
-    )
+c1.metric("OR analysés", df_final.shape[0])
+c2.metric("OR multi-techniciens", df_final[df_final["OR_multi_tech"] == "OUI"].shape[0])
+c3.metric("Heures pointées totales", round(df_final["Heures_totales_OR"].sum(), 1))
+c4.metric("OR sans temps BO", df_final["Temps_reference_OR"].isna().sum())
 
-    st.divider()
+st.divider()
 
-    # =========================
-    # Filtres
-    # =========================
-    equipe = st.multiselect(
-        "Filtrer par équipe",
-        options=df_final["Equipe_principale"].dropna().unique()
-    )
+# ======================================================
+# FILTRES
+# ======================================================
+st.subheader("🎯 Filtres")
 
-    if equipe:
-        df_final = df_final[df_final["Equipe_principale"].isin(equipe)]
+equipes = st.multiselect(
+    "Filtrer par équipe",
+    options=sorted(df_final["Equipe_principale"].dropna().unique())
+)
 
-    # =========================
-    # Tables
-    # =========================
-    st.subheader("📋 Vue OR agrégée")
-    st.dataframe(
-        df_final.sort_values("Heures_totales_OR", ascending=False),
-        use_container_width=True
-    )
+if equipes:
+    df_final = df_final[df_final["Equipe_principale"].isin(equipes)]
+    pointage_or_tech = pointage_or_tech[
+        pointage_or_tech["Equipe"].isin(equipes)
+    ]
 
-    st.subheader("🔍 Détail OR multi-techniciens")
-    st.dataframe(
-        df_final[df_final["OR_multi_tech"] == "OUI"],
-        use_container_width=True
-    )
+# ======================================================
+# AFFICHAGE TABLES
+# ======================================================
+st.subheader("📋 Vue OR agrégée (pilotage)")
 
-else:
-    st.info("⬆️ Merci de charger le fichier Excel pour démarrer l'analyse.")
+st.dataframe(
+    df_final.sort_values("Heures_totales_OR", ascending=False),
+    use_container_width=True
+)
+
+st.subheader("👥 Détail OR × Technicien (opérationnel)")
+
+st.dataframe(
+    pointage_or_tech.sort_values("Heures_technicien", ascending=False),
+    use_container_width=True
+)
+
+st.subheader("⚠️ OR multi-techniciens")
+
+st.dataframe(
+    df_final[df_final["OR_multi_tech"] == "OUI"],
+    use_container_width=True
+)
