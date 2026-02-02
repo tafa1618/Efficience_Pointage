@@ -12,7 +12,7 @@ st.set_page_config(
 st.title("📊 Analyse d’efficience des pointages OR")
 
 # ======================================================
-# UPLOAD
+# UPLOAD FICHIER
 # ======================================================
 uploaded_file = st.file_uploader(
     "📥 Charger le fichier Excel (Pointage + BASE_BO)",
@@ -24,13 +24,13 @@ if not uploaded_file:
     st.stop()
 
 # ======================================================
-# LECTURE FICHIERS
+# LECTURE DES FEUILLES
 # ======================================================
 pointage = pd.read_excel(uploaded_file, sheet_name="Pointage")
 bo = pd.read_excel(uploaded_file, sheet_name="BASE_BO")
 
 # ======================================================
-# FONCTION NORMALISATION OR (CLÉ MÉTIER ROBUSTE)
+# FONCTION NORMALISATION OR (clé métier robuste)
 # ======================================================
 def normalize_or(x):
     if pd.isna(x):
@@ -40,14 +40,12 @@ def normalize_or(x):
     x = x.split("/")[0]
     x = x.replace(".0", "")
     x = "".join(filter(str.isdigit, x))
-    return x if x != "" else None
+    return x if x else None
 
 # ======================================================
 # NORMALISATION POINTAGE
 # ======================================================
-pointage["OR_RAW"] = pointage["OR (Numéro)"].astype(str)
-pointage["OR_KEY"] = pointage["OR_RAW"].apply(normalize_or)
-
+pointage["OR_KEY"] = pointage["OR (Numéro)"].apply(normalize_or)
 pointage["Technicien"] = pointage["Salarié - Nom"]
 pointage["Equipe"] = pointage["Salarié - Equipe(Nom)"]
 pointage["Heures"] = pointage["Hr_travaillée"]
@@ -61,25 +59,26 @@ pointage["Annee"] = pointage["Date"].dt.year
 # ======================================================
 # NORMALISATION BO
 # ======================================================
-bo["OR_RAW"] = bo["N° OR (Segment)"].astype(str)
-bo["OR_KEY"] = bo["OR_RAW"].apply(normalize_or)
+bo["OR_KEY"] = bo["N° OR (Segment)"].apply(normalize_or)
 
 bo["Temps_reference_OR"] = bo["Temps vendu (OR)"].fillna(
     bo["Temps prévu devis (OR)"]
 )
 
 # ======================================================
-# FILTRE ANNÉE (ANALYSE UNIQUEMENT)
+# FILTRES SIDEBAR
 # ======================================================
-annees_disponibles = sorted(pointage["Annee"].dropna().unique())
+st.sidebar.header("🎯 Filtres d’analyse")
 
-annees_selectionnees = st.multiselect(
-    "📅 Filtrer par année",
-    options=annees_disponibles,
-    default=annees_disponibles
+# ---- Filtre année
+annees = sorted(pointage["Annee"].dropna().unique())
+annees_sel = st.sidebar.multiselect(
+    "Année",
+    options=annees,
+    default=annees
 )
 
-pointage = pointage[pointage["Annee"].isin(annees_selectionnees)]
+pointage = pointage[pointage["Annee"].isin(annees_sel)]
 
 # ======================================================
 # AGRÉGATION POINTAGE → 1 OR = 1 LIGNE
@@ -95,7 +94,7 @@ agg_or = (
 )
 
 # ======================================================
-# TECHNICIEN PRINCIPAL (MAX HEURES)
+# TECHNICIEN & ÉQUIPE PRINCIPALE (max heures)
 # ======================================================
 tech_principal = (
     pointage
@@ -119,17 +118,10 @@ pointage_or["OR_multi_tech"] = pointage_or["Nb_techniciens"].apply(
 )
 
 # ======================================================
-# PRÉPARATION BO POUR MERGE
+# MERGE AVEC BO
 # ======================================================
-bo_or = bo[[
-    "OR_KEY",
-    "Temps_reference_OR",
-    "Durée pointage agents productifs (OR)"
-]]
+bo_or = bo[["OR_KEY", "Temps_reference_OR"]]
 
-# ======================================================
-# MERGE FINAL (CLÉ ROBUSTE)
-# ======================================================
 df = pointage_or.merge(
     bo_or,
     on="OR_KEY",
@@ -137,15 +129,30 @@ df = pointage_or.merge(
 )
 
 # ======================================================
-# INDICATEURS
+# CALCULS D’EFFICIENCE
 # ======================================================
-df["Taux_couverture_OR"] = (
-    df["Heures_totales_OR"] / df["Temps_reference_OR"]
+# Ratio brut (diagnostic)
+df["Taux_couverture"] = df["Heures_totales_OR"] / df["Temps_reference_OR"]
+
+# 🔥 Efficience (%) — peut être > 100 %
+df["Efficience_%"] = (
+    df["Temps_reference_OR"] / df["Heures_totales_OR"]
+) * 100
+
+df.loc[df["Heures_totales_OR"] <= 0, "Efficience_%"] = None
+
+# ======================================================
+# FILTRE ÉQUIPE (APRÈS MERGE)
+# ======================================================
+equipes = sorted(df["Equipe_principale"].dropna().unique())
+
+equipes_sel = st.sidebar.multiselect(
+    "Équipe",
+    options=equipes,
+    default=equipes
 )
 
-df["Ecart_heures"] = (
-    df["Heures_totales_OR"] - df["Temps_reference_OR"]
-)
+df = df[df["Equipe_principale"].isin(equipes_sel)]
 
 # ======================================================
 # KPI GLOBAUX
@@ -162,9 +169,9 @@ c4.metric("OR sans BO", df["Temps_reference_OR"].isna().sum())
 st.divider()
 
 # ======================================================
-# GRAPHIQUES – PILOTAGE
+# 📊 GRAPHIQUES – PILOTAGE
 # ======================================================
-st.subheader("📊 Lecture rapide – Efficience")
+st.subheader("📊 Pilotage de l’efficience")
 
 col1, col2 = st.columns(2)
 
@@ -176,13 +183,13 @@ heures_equipe = (
 )
 col1.bar_chart(heures_equipe)
 
-# Taux couverture moyen par équipe
-taux_equipe = (
-    df.groupby("Equipe_principale")["Taux_couverture_OR"]
+# 🔥 Efficience moyenne par équipe
+efficience_equipe = (
+    df.groupby("Equipe_principale")["Efficience_%"]
     .mean()
     .sort_values(ascending=False)
 )
-col2.bar_chart(taux_equipe)
+col2.bar_chart(efficience_equipe)
 
 st.divider()
 
@@ -191,37 +198,22 @@ st.divider()
 # ======================================================
 st.subheader("👷‍♂️ Efficience par technicien (principal)")
 
-taux_tech = (
-    df.groupby("Technicien_principal")["Taux_couverture_OR"]
+efficience_tech = (
+    df.groupby("Technicien_principal")["Efficience_%"]
     .mean()
     .sort_values()
 )
 
-st.bar_chart(taux_tech)
+st.bar_chart(efficience_tech)
 
 st.divider()
 
 # ======================================================
-# Pareto OR en dérive
-# ======================================================
-st.subheader("⚠️ Pareto des OR en surconsommation")
-
-pareto = (
-    df[df["Ecart_heures"] > 0]
-    .sort_values("Ecart_heures", ascending=False)
-    .set_index("OR_KEY")["Ecart_heures"]
-)
-
-st.bar_chart(pareto)
-
-st.divider()
-
-# ======================================================
-# TABLES (EXPORT / AUDIT)
+# TABLE EXPORT / AUDIT
 # ======================================================
 st.subheader("📋 Table OR agrégée (export)")
 
 st.dataframe(
-    df.sort_values("Heures_totales_OR", ascending=False),
+    df.sort_values("Efficience_%"),
     use_container_width=True
 )
