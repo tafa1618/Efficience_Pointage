@@ -1,171 +1,102 @@
 import streamlit as st
 import pandas as pd
 import duckdb
-import numpy as np
 
 # ======================================================
-# CONFIGURATION & STYLE
+# CONFIGURATION
 # ======================================================
-st.set_page_config(page_title="Efficience OR - Engine v2", layout="wide")
-st.title("📊 Analyse d’efficience des pointages OR")
-st.markdown("---")
+st.set_page_config(page_title="Efficience OR - Force Numeric", layout="wide")
+st.title("📊 Analyse d’efficience (Conversion Numérique)")
 
-# ======================================================
-# CHARGEMENT DES DONNÉES
-# ======================================================
-uploaded_file = st.file_uploader(
-    "📥 Charger le fichier Excel (Onglets: Pointage + BASE_BO)",
-    type=["xlsx"]
-)
+uploaded_file = st.file_uploader("📥 Charger le fichier Excel", type=["xlsx"])
 
 if not uploaded_file:
-    st.info("En attente du fichier Excel pour démarrer l'analyse.")
     st.stop()
 
 @st.cache_data
-def get_data(file):
-    df_p = pd.read_excel(file, sheet_name="Pointage")
-    df_b = pd.read_excel(file, sheet_name="BASE_BO")
-    return df_p, df_b
+def load_data(file):
+    return pd.read_excel(file, sheet_name="Pointage"), pd.read_excel(file, sheet_name="BASE_BO")
 
-try:
-    df_p_raw, df_b_raw = get_data(uploaded_file)
-except Exception as e:
-    st.error(f"Erreur lors de la lecture des onglets : {e}")
-    st.stop()
+df_p_raw, df_b_raw = load_data(uploaded_file)
 
 # ======================================================
-# MOTEUR DE TRANSFORMATION SQL (DUCKDB)
+# MOTEUR SQL AVEC CONVERSION NUMÉRIQUE FORCÉE
 # ======================================================
 con = duckdb.connect(database=':memory:')
 con.register('raw_p', df_p_raw)
 con.register('raw_b', df_b_raw)
 
-# Normalisation agressive des clés OR
-# 1. On garde uniquement les chiffres
-# 2. On enlève les zéros au début (ex: 00123 -> 123)
-# 3. On gère les extensions type /01 ou -A
+# La logique ici :
+# 1. Extraire uniquement les chiffres via regexp_replace
+# 2. Convertir le résultat en BIGINT pour supprimer les '000' et uniformiser le type
 con.execute("""
     CREATE OR REPLACE VIEW v_pointage AS
     SELECT 
-        ltrim(regexp_replace(split_part(split_part(CAST("OR (Numéro)" AS VARCHAR), '-', 1), '/', 1), '[^0-9]', '', 'g'), '0') AS OR_KEY_CLEAN,
+        CAST(regexp_replace(split_part(CAST("OR (Numéro)" AS VARCHAR), '-', 1), '[^0-9]', '', 'g') AS BIGINT) AS OR_ID,
         "Salarié - Nom" AS Technicien,
         "Salarié - Equipe(Nom)" AS Equipe,
         Hr_travaillée AS Heures,
         CAST("Saisie heures - Date" AS DATE) AS Date_Pointage
     FROM raw_p
-    WHERE "OR (Numéro)" IS NOT NULL;
+    WHERE "OR (Numéro)" IS NOT NULL 
+      AND regexp_replace(CAST("OR (Numéro)" AS VARCHAR), '[^0-9]', '', 'g') != '';
 
     CREATE OR REPLACE VIEW v_bo AS
     SELECT 
-        ltrim(regexp_replace(split_part(split_part(CAST("N° OR (Segment)" AS VARCHAR), '-', 1), '/', 1), '[^0-9]', '', 'g'), '0') AS OR_KEY_CLEAN,
+        CAST(regexp_replace(split_part(CAST("N° OR (Segment)" AS VARCHAR), '-', 1), '[^0-9]', '', 'g') AS BIGINT) AS OR_ID,
         COALESCE("Temps vendu (OR)", "Temps prévu devis (OR)") AS Temps_Ref
     FROM raw_b
-    WHERE "N° OR (Segment)" IS NOT NULL;
+    WHERE "N° OR (Segment)" IS NOT NULL
+      AND regexp_replace(CAST("N° OR (Segment)" AS VARCHAR), '[^0-9]', '', 'g') != '';
 """)
 
-# Agrégation et Jointure
+# Jointure sur les IDs numériques
 query = """
 WITH p_agg AS (
     SELECT 
-        OR_KEY_CLEAN,
+        OR_ID,
         SUM(Heures) as Heures_Totales,
-        COUNT(DISTINCT Technicien) as Nb_Tech,
-        ARGMAX(Technicien, Heures) as Tech_Principal,
         ARGMAX(Equipe, Heures) as Equipe_Principale,
         YEAR(MIN(Date_Pointage)) as Annee
     FROM v_pointage
-    GROUP BY OR_KEY_CLEAN
+    GROUP BY OR_ID
 ),
 b_agg AS (
     SELECT 
-        OR_KEY_CLEAN,
+        OR_ID,
         MAX(Temps_Ref) as Temps_Reference
     FROM v_bo
-    GROUP BY OR_KEY_CLEAN
+    GROUP BY OR_ID
 )
 SELECT 
     p.*,
     b.Temps_Reference,
-    CASE 
-        WHEN b.Temps_Reference IS NULL THEN 0 
-        WHEN p.Heures_Totales = 0 THEN 0
-        ELSE (b.Temps_Reference / p.Heures_Totales) * 100 
-    END as Efficience_Pct
+    (b.Temps_Reference / NULLIF(p.Heures_Totales, 0)) * 100 as Efficience_Pct
 FROM p_agg p
-LEFT JOIN b_agg b ON p.OR_KEY_CLEAN = b.OR_KEY_CLEAN
+LEFT JOIN b_agg b ON p.OR_ID = b.OR_ID
 """
 
 df_final = con.execute(query).df()
 
 # ======================================================
-# FILTRES & DASHBOARD
+# AFFICHAGE & FILTRES
 # ======================================================
-# Sidebar
+st.sidebar.header("Filtres")
 annees = sorted(df_final['Annee'].dropna().unique().astype(int))
 sel_annees = st.sidebar.multiselect("Années", options=annees, default=annees)
+df_view = df_final[df_final['Annee'].isin(sel_annees)]
 
-# Application du filtre
-df_view = df_final[df_final['Annee'].isin(sel_annees)].copy()
+# Métriques de contrôle
+c1, c2, c3 = st.columns(3)
+c1.metric("OR total (Pointage)", len(df_view))
+c2.metric("OR répertoriés dans BO", df_view['Temps_Reference'].notna().sum())
+c3.metric("Échecs de correspondance", df_view['Temps_Reference'].isna().sum())
 
-# Calcul des indicateurs
-total_or = len(df_view)
-matched_or = df_view['Temps_Reference'].notna().sum()
-unmatched_or = total_or - matched_or
-
-# Affichage des KPIs
-st.subheader("📌 Indicateurs clés")
-c1, c2, c3, c4 = st.columns(4)
-c1.metric("OR Analysés", total_or)
-c2.metric("Heures Pointées", f"{df_view['Heures_Totales'].sum():.1f}h")
-c3.metric("OR avec Temps BO", matched_or)
-c4.metric("Efficience Moyenne", f"{df_view[df_view['Temps_Reference'].notna()]['Efficience_Pct'].mean():.1f}%")
-
-# Mode Debug si rien ne matche
-if matched_or == 0 and total_or > 0:
-    st.error("⚠️ AUCUNE CORRESPONDANCE TROUVÉE")
-    st.warning("Vérifiez les formats de vos numéros d'OR ci-dessous :")
-    db_col1, db_col2 = st.columns(2)
-    with db_col1:
-        st.write("Exemple clés Pointage :")
-        st.write(con.execute("SELECT DISTINCT OR_KEY_CLEAN FROM v_pointage LIMIT 5").df())
-    with db_col2:
-        st.write("Exemple clés BO :")
-        st.write(con.execute("SELECT DISTINCT OR_KEY_CLEAN FROM v_bo LIMIT 5").df())
-    st.stop()
-
-st.divider()
-
-# ======================================================
-# VISUALISATION
-# ======================================================
-col_left, col_right = st.columns(2)
-
-with col_left:
-    st.subheader("📊 Efficience par équipe")
-    eff_eq = df_view.dropna(subset=['Temps_Reference']).groupby("Equipe_Principale")["Efficience_Pct"].mean().sort_values()
-    st.bar_chart(eff_eq, horizontal=True)
-
-with col_right:
-    st.subheader("📋 Répartition Multi-Tech")
-    multi_counts = df_view['Nb_Tech'].value_counts()
-    st.bar_chart(multi_counts)
-
-st.subheader("🔍 Détail des calculs par OR")
-st.dataframe(
-    df_view.sort_values("Efficience_Pct", ascending=False),
-    use_container_width=True,
-    column_config={
-        "Efficience_Pct": st.column_config.ProgressColumn("Efficience %", format="%.1f%%", min_value=0, max_value=200),
-        "Temps_Reference": "Temps Vendu (h)",
-        "Heures_Totales": "Heures Réelles (h)"
-    }
-)
-
-# Export option
-st.download_button(
-    "📥 Télécharger les résultats (CSV)",
-    df_view.to_csv(index=False).encode('utf-8'),
-    "analyse_efficience.csv",
-    "text/csv"
-)
+if df_view['Temps_Reference'].notna().sum() == 0:
+    st.error("❌ Toujours aucune correspondance.")
+    st.info("Vérification des 5 premières clés numériques générées :")
+    st.write("Côté Pointage :", con.execute("SELECT DISTINCT OR_ID FROM v_pointage LIMIT 5").df())
+    st.write("Côté BO :", con.execute("SELECT DISTINCT OR_ID FROM v_bo LIMIT 5").df())
+else:
+    st.success("✅ Correspondance établie !")
+    st.dataframe(df_view.sort_values("Efficience_Pct", ascending=False), use_container_width=True)
